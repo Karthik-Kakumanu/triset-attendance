@@ -10,23 +10,42 @@ async function api(url, options = {}) {
 }
 
 function esc(v='') { return String(v).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
-function fmtTime(v) { return v ? new Date(String(v).replace(' ', 'T') + 'Z').toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'medium', hour12: true }) : '—'; }
-function fmtDate(v) { return v ? new Date(`${v}T00:00:00Z`).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric', timeZone:'UTC' }) : '—'; }
+function parseISTDate(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (/[zZ]$|[+-]\d{2}:\d{2}$/.test(raw)) {
+    const date = new Date(raw);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  const normalized = raw.replace(' ', 'T');
+  const date = new Date(`${normalized}+05:30`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+function fmtTime(v) {
+  const date = parseISTDate(v);
+  return date ? date.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'medium', hour12: true, timeZone: 'Asia/Kolkata' }) : '—';
+}
+function fmtDate(v) {
+  const date = parseISTDate(v ? `${v} 00:00:00` : null);
+  return date ? date.toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric', timeZone:'Asia/Kolkata' }) : '—';
+}
+function istToday() { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date()); }
 
 function layout(title, content) {
+  const isAdminSubpage = state.me?.role === 'ADMIN' && title !== 'Admin Dashboard';
   app.innerHTML = `
     <header class="topbar">
-      <div><strong>Employee Attendance</strong><span class="muted">Private company system</span></div>
+      <div class="brand-lockup"><span class="brand-mark">TS</span><span><strong>TRISET</strong><small>Attendance Suite</small></span></div>
       <div class="top-actions"><span>${esc(state.me?.name || '')}</span><button class="ghost" onclick="logout()">Logout</button></div>
     </header>
-    <main class="container"><div class="page-title"><h1>${esc(title)}</h1></div>${content}</main>`;
+    <main class="container"><div class="page-title"><div><p class="eyebrow">TRISET SOLUTIONS</p><h1>${esc(title)}</h1></div>${isAdminSubpage ? '<button class="back-button" onclick="adminDashboard()">← Back to dashboard</button>' : ''}</div>${content}</main>`;
 }
 
 function loginView(message='') {
   app.innerHTML = `
     <main class="auth-wrap">
       <div class="auth-card">
-        <div class="brand">EMPLOYEE ATTENDANCE</div>
+        <div class="login-brand"><span class="brand-mark large">TS</span><div><div class="brand">TRISET SOLUTIONS</div><span class="muted">Attendance Suite</span></div></div>
         <h1>Sign in</h1>
         <p class="muted">Use the email and password created by the administrator.</p>
         ${message ? `<div class="alert error">${esc(message)}</div>` : ''}
@@ -67,16 +86,17 @@ async function employeeDashboard() {
     const data = await api('/api/employee/today');
     const s = data.session;
     const activeBreak = data.breaks.find(b => !b.break_end_at);
-    const status = !s ? 'LOGGED OUT' : activeBreak ? 'ON BREAK' : 'WORKING';
+    const status = !s || s.check_out_at ? 'LOGGED OUT' : activeBreak ? 'ON BREAK' : 'WORKING';
     layout('My Attendance', `
       <section class="welcome"><div><h2>Hi, ${esc(state.me.name)}</h2><p class="muted">All attendance timestamps are recorded by the server/database.</p></div><span class="status ${statusClass(status)}">${status}</span></section>
       <section class="cards">
+        <div class="card"><span>Login time</span><strong>${fmtTime(data.login_at)}</strong></div>
         <div class="card"><span>Check in</span><strong>${fmtTime(s?.check_in_at)}</strong></div>
         <div class="card"><span>Today's breaks</span><strong>${data.breaks.length}</strong></div>
         <div class="card"><span>Last action</span><strong>${activeBreak ? 'Break started' : s ? (s.check_out_at ? 'Checked out' : 'Working') : 'Not checked in'}</strong></div>
       </section>
       <section class="panel action-panel">
-        ${!s ? `<button class="primary big" onclick="employeeAction('/api/employee/check-in')">CHECK IN</button>` : activeBreak ? `<button class="primary big" onclick="employeeAction('/api/employee/break/end')">RESUME WORK</button>` : `<button class="warning big" onclick="employeeAction('/api/employee/break/start')">START BREAK</button><button class="danger big" onclick="employeeAction('/api/employee/check-out')">CHECK OUT</button>`}
+        ${!s ? `<button class="primary big" onclick="employeeAction('/api/employee/check-in')">CHECK IN</button>` : s.check_out_at ? `<p class="muted">Checked out at ${fmtTime(s.check_out_at)}.</p>` : activeBreak ? `<button class="primary big" onclick="employeeAction('/api/employee/break/end')">RESUME WORK</button>` : `<button class="warning big" onclick="employeeAction('/api/employee/break/start')">START BREAK</button><button class="danger big" onclick="employeeAction('/api/employee/check-out')">CHECK OUT</button>`}
       </section>
       <section class="panel"><h2>Break history</h2>${data.breaks.length ? `<div class="table-wrap"><table><thead><tr><th>#</th><th>Start</th><th>End</th><th>Duration</th></tr></thead><tbody>${data.breaks.map((b,i)=>`<tr><td>${i+1}</td><td>${fmtTime(b.break_start_at)}</td><td>${fmtTime(b.break_end_at)}</td><td>${esc(b.duration)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">No breaks recorded.</p>'}</section>`);
     refreshLater(employeeDashboard, 10000);
@@ -98,7 +118,7 @@ async function adminDashboard() {
     layout('Admin Dashboard', `
       <section class="cards four"><div class="card"><span>Employees</span><strong>${stats.employees}</strong></div><div class="card"><span>Working</span><strong>${stats.working}</strong></div><div class="card"><span>On break</span><strong>${stats.on_break}</strong></div><div class="card"><span>Logged out</span><strong>${stats.logged_out}</strong></div></section>
       <section class="panel"><div class="toolbar"><h2>Live attendance</h2><div><button class="ghost" onclick="employeesPage()">Employees</button> <button class="ghost" onclick="attendancePage()">Attendance & Reports</button></div></div>
-      <div class="table-wrap"><table><thead><tr><th>Employee</th><th>Department</th><th>Status</th><th>Check in</th></tr></thead><tbody>${live.map(r=>`<tr><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.employee_code)}</span></td><td>${esc(r.designation || '—')}</td><td><span class="status ${statusClass(r.status)}">${esc(r.status)}</span></td><td>${fmtTime(r.check_in_at)}</td></tr>`).join('')}</tbody></table></div></section>`);
+      <div class="table-wrap"><table><thead><tr><th>Employee</th><th>Department</th><th>Status</th><th>Login</th><th>Check in</th></tr></thead><tbody>${live.map(r=>`<tr><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.employee_code)}</span></td><td>${esc(r.designation || '—')}</td><td><span class="status ${statusClass(r.status)}">${esc(r.status)}</span></td><td>${fmtTime(r.login_at)}</td><td>${fmtTime(r.check_in_at)}</td></tr>`).join('')}</tbody></table></div></section>`);
     refreshLater(adminDashboard, 10000);
   } catch (err) { layout('Admin Dashboard', `<div class="alert error">${esc(err.message)}</div>`); }
 }
@@ -137,7 +157,7 @@ function editEmployee(row) { showEmployeeForm(row); }
 
 async function attendancePage() {
   clearInterval(state.refreshTimer);
-  const today = new Date().toISOString().slice(0,10);
+  const today = istToday();
   layout('Attendance & Reports', `<section class="panel"><div class="filters"><label>From<input id="from" type="date" value="${today}" /></label><label>To<input id="to" type="date" value="${today}" /></label><button class="primary" onclick="loadAttendance()">Load</button><button class="ghost" onclick="downloadCsv()">Export CSV</button></div><div id="attendanceTable"></div></section>`);
   await loadAttendance();
 }

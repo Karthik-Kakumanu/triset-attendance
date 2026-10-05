@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
@@ -44,9 +45,13 @@ function asyncHandler(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 }
 
-function issueSession(res, user) {
+function hashSessionId(sessionId) {
+  return crypto.createHash('sha256').update(sessionId).digest('hex');
+}
+
+function issueSession(res, user, sessionId) {
   const token = jwt.sign(
-    { sub: String(user.id), role: user.role, name: user.name, email: user.email },
+    { sub: String(user.id), role: user.role, name: user.name, email: user.email, sid: sessionId },
     JWT_SECRET,
     { expiresIn: '12h' }
   );
@@ -59,11 +64,22 @@ function issueSession(res, user) {
   });
 }
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   try {
     const token = req.cookies[COOKIE_NAME];
     if (!token) return res.status(401).json({ error: 'Not logged in' });
-    req.user = jwt.verify(token, JWT_SECRET);
+    const user = jwt.verify(token, JWT_SECRET);
+    const table = user.role === 'ADMIN' ? 'admins' : user.role === 'EMPLOYEE' ? 'employees' : null;
+    if (!table || !user.sid) return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    const conn = await pool.getConnection();
+    try {
+      await withIST(conn);
+      const [rows] = await conn.execute(`SELECT active_session_hash FROM ${table} WHERE id = ? AND active_session_hash = ? AND active_session_expires_at > NOW() LIMIT 1`, [user.sub, hashSessionId(user.sid)]);
+      if (!rows.length) return res.status(401).json({ error: 'This session is no longer active. Please log in again.' });
+    } finally {
+      conn.release();
+    }
+    req.user = user;
     next();
   } catch {
     return res.status(401).json({ error: 'Session expired. Please log in again.' });
@@ -94,10 +110,18 @@ function cleanEmployee(row) {
   };
 }
 
+function parseISTDate(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  const hasTimezone = /[zZ]$|[+-]\d{2}:\d{2}$/.test(raw);
+  const normalized = raw.replace(' ', 'T');
+  const date = new Date(hasTimezone ? normalized : `${normalized}+05:30`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 function toSeconds(dateString) {
-  if (!dateString) return null;
-  const d = new Date(dateString.replace(' ', 'T') + 'Z');
-  return Math.floor(d.getTime() / 1000);
+  const date = parseISTDate(dateString);
+  return date ? Math.floor(date.getTime() / 1000) : null;
 }
 
 function diffSeconds(start, end) {
@@ -122,6 +146,7 @@ async function initDatabase() {
   try {
     await conn.query(`SET time_zone = '+05:30'`);
     for (const statement of statements) await conn.query(statement);
+    await ensureSessionColumns(conn);
     const [rows] = await conn.query('SELECT COUNT(*) AS count FROM admins');
     if (Number(rows[0].count) === 0) {
       const email = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
@@ -138,6 +163,45 @@ async function initDatabase() {
     }
   } finally {
     conn.release();
+  }
+}
+
+async function ensureSessionColumns(conn) {
+  for (const table of ['admins', 'employees']) {
+    const [columns] = await conn.execute(
+      `SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME IN ('active_session_hash', 'active_session_expires_at')`,
+      [table]
+    );
+    const existing = new Set(columns.map(column => column.COLUMN_NAME));
+    if (!existing.has('active_session_hash')) {
+      await conn.query(`ALTER TABLE ${table} ADD COLUMN active_session_hash CHAR(64) NULL`);
+    }
+    if (!existing.has('active_session_expires_at')) {
+      await conn.query(`ALTER TABLE ${table} ADD COLUMN active_session_expires_at DATETIME NULL`);
+    }
+  }
+}
+
+async function claimLoginSession(conn, table, id) {
+  const sessionId = crypto.randomUUID();
+  const sessionHash = hashSessionId(sessionId);
+  await conn.beginTransaction();
+  try {
+    const [rows] = await conn.execute(`SELECT active_session_expires_at, active_session_expires_at > NOW() AS session_is_active FROM ${table} WHERE id = ? FOR UPDATE`, [id]);
+    if (!rows.length) {
+      await conn.rollback();
+      return null;
+    }
+    if (Number(rows[0].session_is_active) === 1) {
+      await conn.rollback();
+      return null;
+    }
+    await conn.execute(`UPDATE ${table} SET active_session_hash = ?, active_session_expires_at = DATE_ADD(NOW(), INTERVAL 12 HOUR) WHERE id = ?`, [sessionHash, id]);
+    await conn.commit();
+    return sessionId;
+  } catch (error) {
+    await conn.rollback();
+    throw error;
   }
 }
 
@@ -170,7 +234,9 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
       if (!admin.is_active || !(await bcrypt.compare(password, admin.password_hash))) {
         return res.status(401).json({ error: 'Invalid login.' });
       }
-      issueSession(res, { id: admin.id, role: 'ADMIN', name: admin.name, email: admin.email });
+      const sessionId = await claimLoginSession(conn, 'admins', admin.id);
+      if (!sessionId) return res.status(409).json({ error: 'This account is already logged in somewhere else. Log out from the other device first.' });
+      issueSession(res, { id: admin.id, role: 'ADMIN', name: admin.name, email: admin.email }, sessionId);
       await conn.execute('INSERT INTO audit_logs (actor_type, actor_id, action, details) VALUES (?,?,?,?)', ['ADMIN', admin.id, 'LOGIN', JSON.stringify({ ip: req.ip })]);
       return res.json({ role: 'ADMIN', name: admin.name, email: admin.email });
     }
@@ -181,7 +247,9 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
     if (!emp.is_active || !(await bcrypt.compare(password, emp.password_hash))) {
       return res.status(401).json({ error: 'Invalid login.' });
     }
-    issueSession(res, { id: emp.id, role: 'EMPLOYEE', name: emp.name, email: emp.email });
+    const sessionId = await claimLoginSession(conn, 'employees', emp.id);
+    if (!sessionId) return res.status(409).json({ error: 'This account is already logged in somewhere else. Log out from the other device first.' });
+    issueSession(res, { id: emp.id, role: 'EMPLOYEE', name: emp.name, email: emp.email }, sessionId);
     await conn.execute('INSERT INTO audit_logs (actor_type, actor_id, action, details) VALUES (?,?,?,?)', ['EMPLOYEE', emp.id, 'LOGIN', JSON.stringify({ ip: req.ip })]);
     return res.json({ role: 'EMPLOYEE', name: emp.name, email: emp.email });
   } finally {
@@ -190,6 +258,14 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/auth/logout', requireAuth, asyncHandler(async (req, res) => {
+  const table = req.user.role === 'ADMIN' ? 'admins' : 'employees';
+  const conn = await pool.getConnection();
+  try {
+    await withIST(conn);
+    await conn.execute(`UPDATE ${table} SET active_session_hash = NULL, active_session_expires_at = NULL WHERE id = ? AND active_session_hash = ?`, [req.user.sub, hashSessionId(req.user.sid)]);
+  } finally {
+    conn.release();
+  }
   res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', path: '/' });
   res.json({ ok: true });
 }));
@@ -202,11 +278,19 @@ app.get('/api/employee/today', requireAuth, requireRole('EMPLOYEE'), asyncHandle
   const conn = await pool.getConnection();
   try {
     await withIST(conn);
-    const [sessions] = await conn.execute(
-      `SELECT * FROM attendance_sessions WHERE employee_id = ? AND check_out_at IS NULL ORDER BY id DESC LIMIT 1`,
+    const [loginRows] = await conn.execute(
+      `SELECT created_at AS login_at FROM audit_logs
+       WHERE actor_type = 'EMPLOYEE' AND actor_id = ? AND action = 'LOGIN'
+         AND created_at >= CURDATE() AND created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+       ORDER BY created_at DESC LIMIT 1`,
       [req.user.sub]
     );
-    if (!sessions.length) return res.json({ session: null, breaks: [] });
+    const login_at = loginRows[0]?.login_at || null;
+    const [sessions] = await conn.execute(
+      `SELECT * FROM attendance_sessions WHERE employee_id = ? AND work_date = CURDATE() ORDER BY id DESC LIMIT 1`,
+      [req.user.sub]
+    );
+    if (!sessions.length) return res.json({ session: null, breaks: [], login_at });
     const session = sessions[0];
     const [breakRows] = await conn.execute('SELECT * FROM breaks WHERE attendance_id = ? ORDER BY id ASC', [session.id]);
     const breaks = breakRows.map(b => ({
@@ -214,7 +298,7 @@ app.get('/api/employee/today', requireAuth, requireRole('EMPLOYEE'), asyncHandle
       duration_seconds: b.break_end_at ? diffSeconds(b.break_start_at, b.break_end_at) : null,
       duration: b.break_end_at ? formatDuration(diffSeconds(b.break_start_at, b.break_end_at)) : 'Ongoing'
     }));
-    res.json({ session, breaks });
+    res.json({ session, breaks, login_at });
   } finally {
     conn.release();
   }
@@ -397,6 +481,10 @@ app.get('/api/admin/live', requireAuth, requireRole('ADMIN'), asyncHandler(async
     await withIST(conn);
     const [rows] = await conn.query(
       `SELECT e.id, e.employee_code, e.name, e.email, e.designation, a.id AS attendance_id, a.check_in_at,
+        (SELECT al.created_at FROM audit_logs al
+         WHERE al.actor_type = 'EMPLOYEE' AND al.actor_id = e.id AND al.action = 'LOGIN'
+           AND al.created_at >= CURDATE() AND al.created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+         ORDER BY al.created_at DESC LIMIT 1) AS login_at,
         CASE WHEN EXISTS (SELECT 1 FROM breaks b WHERE b.attendance_id=a.id AND b.break_end_at IS NULL) THEN 'ON BREAK' ELSE 'WORKING' END AS status
        FROM employees e LEFT JOIN attendance_sessions a ON a.employee_id=e.id AND a.check_out_at IS NULL
        WHERE e.is_active=1 ORDER BY e.name ASC`
