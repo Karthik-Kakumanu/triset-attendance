@@ -204,6 +204,10 @@ async function claimLoginSession(conn, table, accountType, id, req) {
        VALUES (?, ?, ?, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 12 HOUR), ?, ?)`,
       [accountType, id, sessionHash, String(req.get('user-agent') || '').slice(0, 500), String(req.ip || '').slice(0, 80)]
     );
+    await conn.execute(
+      'INSERT INTO audit_logs (actor_type, actor_id, action, details) VALUES (?,?,?,?)',
+      [accountType, id, 'LOGIN', JSON.stringify({ ip: req.ip })]
+    );
     await conn.commit();
     return sessionId;
   } catch (error) {
@@ -244,7 +248,6 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
       const sessionId = await claimLoginSession(conn, 'admins', 'ADMIN', admin.id, req);
       if (!sessionId) return res.status(409).json({ error: 'ACCOUNT_ALREADY_LOGGED_IN', message: 'This account is already logged in on another device. Log out from the other device first.' });
       issueSession(res, { id: admin.id, role: 'ADMIN', name: admin.name, email: admin.email }, sessionId);
-      await conn.execute('INSERT INTO audit_logs (actor_type, actor_id, action, details) VALUES (?,?,?,?)', ['ADMIN', admin.id, 'LOGIN', JSON.stringify({ ip: req.ip })]);
       return res.json({ role: 'ADMIN', name: admin.name, email: admin.email });
     }
 
@@ -257,7 +260,6 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
     const sessionId = await claimLoginSession(conn, 'employees', 'EMPLOYEE', emp.id, req);
     if (!sessionId) return res.status(409).json({ error: 'ACCOUNT_ALREADY_LOGGED_IN', message: 'This account is already logged in on another device. Log out from the other device first.' });
     issueSession(res, { id: emp.id, role: 'EMPLOYEE', name: emp.name, email: emp.email }, sessionId);
-    await conn.execute('INSERT INTO audit_logs (actor_type, actor_id, action, details) VALUES (?,?,?,?)', ['EMPLOYEE', emp.id, 'LOGIN', JSON.stringify({ ip: req.ip })]);
     return res.json({ role: 'EMPLOYEE', name: emp.name, email: emp.email });
   } finally {
     conn.release();
