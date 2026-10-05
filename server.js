@@ -184,7 +184,7 @@ async function ensureSessionColumns(conn) {
   }
 }
 
-async function claimLoginSession(conn, table, accountType, id, req) {
+async function claimLoginSession(conn, table, accountType, id, req, enforceSingleSession = true) {
   const sessionId = crypto.randomUUID();
   const sessionHash = hashSessionId(sessionId);
   await conn.beginTransaction();
@@ -194,10 +194,12 @@ async function claimLoginSession(conn, table, accountType, id, req) {
       await conn.rollback();
       return null;
     }
-    const [activeSessions] = await conn.execute(`SELECT id FROM user_sessions WHERE account_type = ? AND account_id = ? AND revoked_at IS NULL AND expires_at > NOW() AND last_seen_at >= DATE_SUB(NOW(), INTERVAL ${SESSION_IDLE_TIMEOUT_MINUTES} MINUTE) LIMIT 1 FOR UPDATE`, [accountType, id]);
-    if (activeSessions.length) {
-      await conn.rollback();
-      return null;
+    if (enforceSingleSession) {
+      const [activeSessions] = await conn.execute(`SELECT id FROM user_sessions WHERE account_type = ? AND account_id = ? AND revoked_at IS NULL AND expires_at > NOW() AND last_seen_at >= DATE_SUB(NOW(), INTERVAL ${SESSION_IDLE_TIMEOUT_MINUTES} MINUTE) LIMIT 1 FOR UPDATE`, [accountType, id]);
+      if (activeSessions.length) {
+        await conn.rollback();
+        return null;
+      }
     }
     await conn.execute(
       `INSERT INTO user_sessions (account_type, account_id, session_token_hash, created_at, last_seen_at, expires_at, user_agent, ip_address)
@@ -245,8 +247,8 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
       if (!admin.is_active || !(await bcrypt.compare(password, admin.password_hash))) {
         return res.status(401).json({ error: 'Invalid login.' });
       }
-      const sessionId = await claimLoginSession(conn, 'admins', 'ADMIN', admin.id, req);
-      if (!sessionId) return res.status(409).json({ error: 'ACCOUNT_ALREADY_LOGGED_IN', message: 'This account is already logged in on another device. Log out from the other device first.' });
+      // Admin accounts may use multiple devices. Each device still gets its own session row and cookie.
+      const sessionId = await claimLoginSession(conn, 'admins', 'ADMIN', admin.id, req, false);
       issueSession(res, { id: admin.id, role: 'ADMIN', name: admin.name, email: admin.email }, sessionId);
       return res.json({ role: 'ADMIN', name: admin.name, email: admin.email });
     }
