@@ -1,5 +1,5 @@
 const app = document.getElementById('app');
-const state = { me: null, refreshTimer: null };
+const state = { me: null, refreshTimer: null, refreshing: false, employees: [] };
 
 async function api(url, options = {}) {
   const res = await fetch(url, { credentials: 'include', headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options });
@@ -9,168 +9,67 @@ async function api(url, options = {}) {
   return data;
 }
 
-function esc(v='') { return String(v).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+function esc(v = '') { return String(v).replace(/[&<>'"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[c])); }
 function parseISTDate(value) {
   if (!value) return null;
   const raw = String(value).trim();
-  if (/[zZ]$|[+-]\d{2}:\d{2}$/.test(raw)) {
-    const date = new Date(raw);
-    return Number.isNaN(date.getTime()) ? null : date;
-  }
-  const normalized = raw.replace(' ', 'T');
-  const date = new Date(`${normalized}+05:30`);
+  if (/[zZ]$|[+-]\d{2}:\d{2}$/.test(raw)) { const date = new Date(raw); return Number.isNaN(date.getTime()) ? null : date; }
+  const date = new Date(`${raw.replace(' ', 'T')}+05:30`);
   return Number.isNaN(date.getTime()) ? null : date;
 }
-function fmtTime(v) {
-  const date = parseISTDate(v);
-  return date ? date.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'medium', hour12: true, timeZone: 'Asia/Kolkata' }) : '—';
-}
-function fmtDate(v) {
-  const date = parseISTDate(v ? `${v} 00:00:00` : null);
-  return date ? date.toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric', timeZone:'Asia/Kolkata' }) : '—';
-}
+function fmtTime(value) { const date = parseISTDate(value); return date ? date.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'medium', hour12: true, timeZone: 'Asia/Kolkata' }) : '—'; }
+function fmtClock(value) { const date = parseISTDate(value); return date ? date.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' }) : '—'; }
+function fmtDate(value) { const date = parseISTDate(value ? `${value} 00:00:00` : null); return date ? date.toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric', timeZone:'Asia/Kolkata' }) : '—'; }
+function fmtDuration(seconds) { if (seconds == null) return '—'; const total = Math.max(0, Math.floor(Number(seconds) || 0)); return `${String(Math.floor(total / 3600)).padStart(2, '0')}h ${String(Math.floor((total % 3600) / 60)).padStart(2, '0')}m ${String(total % 60).padStart(2, '0')}s`; }
 function istToday() { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date()); }
+function statusClass(status) { return ({ WORKING:'green', 'ON BREAK':'yellow', 'CHECKED OUT':'blue', 'NOT CHECKED IN':'gray', INACTIVE:'red', 'LOGGED OUT':'gray' })[status] || 'gray'; }
+function clearRefresh() { clearTimeout(state.refreshTimer); state.refreshTimer = null; }
+function scheduleRefresh(fn, ms = 15000) { clearRefresh(); state.refreshTimer = setTimeout(fn, ms); }
+function brand() { return `<img class="company-logo" src="/logo_final.png" alt="TRISET Solutions India Pvt Ltd" />`; }
 
-function layout(title, content) {
-  const isAdminSubpage = state.me?.role === 'ADMIN' && title !== 'Admin Dashboard';
-  app.innerHTML = `
-    <header class="topbar">
-      <div class="brand-lockup"><span class="brand-mark">TS</span><span><strong>TRISET</strong><small>Attendance Suite</small></span></div>
-      <div class="top-actions"><span>${esc(state.me?.name || '')}</span><button class="ghost" onclick="logout()">Logout</button></div>
-    </header>
-    <main class="container"><div class="page-title"><div><p class="eyebrow">TRISET SOLUTIONS</p><h1>${esc(title)}</h1></div>${isAdminSubpage ? '<button class="back-button" onclick="adminDashboard()">← Back to dashboard</button>' : ''}</div>${content}</main>`;
+function layout(title, content, nav = '') {
+  const isAdmin = state.me?.role === 'ADMIN';
+  const subpage = isAdmin && title !== 'Admin Dashboard';
+  app.innerHTML = `<header class="topbar"><div class="brand-lockup">${brand()}<span class="product-name"><strong>Employee Attendance</strong><small>Operations Suite</small></span></div><div class="top-actions"><span>${esc(state.me?.name || '')}</span><button class="ghost" onclick="logout()">Logout</button></div></header><div class="shell ${isAdmin ? 'admin-shell' : ''}">${isAdmin ? `<aside class="sidebar"><div class="sidebar-title">Workspace</div>${nav || adminNav(title)}<div class="sidebar-footer"><span class="avatar">${esc((state.me?.name || 'A').slice(0,1).toUpperCase())}</span><span><strong>${esc(state.me?.name || 'Administrator')}</strong><small>Administrator</small></span></div></aside>` : ''}<main class="container"><div class="page-title"><div><p class="eyebrow">TRISET SOLUTIONS</p><h1>${esc(title)}</h1></div>${subpage ? '<button class="back-button" onclick="adminDashboard()">← Back to dashboard</button>' : ''}</div>${content}</main></div>`;
 }
+function adminNav(active) { return `<button class="nav-item ${active === 'Admin Dashboard' ? 'active' : ''}" onclick="adminDashboard()">▦ <span>Dashboard</span></button><button class="nav-item ${active === 'Employees' || active.includes('Employee') ? 'active' : ''}" onclick="employeesPage()">♙ <span>Employees</span></button><button class="nav-item ${active === 'Attendance & Reports' ? 'active' : ''}" onclick="attendancePage()">◷ <span>Attendance history</span></button>`; }
 
-function loginView(message='') {
-  app.innerHTML = `
-    <main class="auth-wrap">
-      <div class="auth-card">
-        <div class="login-brand"><span class="brand-mark large">TS</span><div><div class="brand">TRISET SOLUTIONS</div><span class="muted">Attendance Suite</span></div></div>
-        <h1>Sign in</h1>
-        <p class="muted">Use the email and password created by the administrator.</p>
-        ${message ? `<div class="alert error">${esc(message)}</div>` : ''}
-        <form onsubmit="login(event)">
-          <label>Email<input id="email" type="email" required autocomplete="username" /></label>
-          <label>Password<input id="password" type="password" required autocomplete="current-password" /></label>
-          <button class="primary full" type="submit">Login</button>
-        </form>
-      </div>
-    </main>`;
-}
-
-async function login(e) {
-  e.preventDefault();
-  const email = document.getElementById('email').value;
-  const password = document.getElementById('password').value;
-  try {
-    state.me = await api('/api/auth/login', { method:'POST', body: JSON.stringify({ email, password }) });
-    render();
-  } catch (err) { loginView(err.message); }
-}
-
-async function logout() {
-  try { await api('/api/auth/logout', { method:'POST' }); } catch {}
-  state.me = null;
-  clearInterval(state.refreshTimer);
-  loginView();
-}
-
-async function render() {
-  if (!state.me) return loginView();
-  if (state.me.role === 'ADMIN') return adminDashboard();
-  return employeeDashboard();
-}
+function loginView(message = '') { clearRefresh(); app.innerHTML = `<main class="auth-wrap"><div class="auth-card">${brand()}<p class="brand-caption">TRISET SOLUTIONS · ATTENDANCE SUITE</p><h1>Welcome back</h1><p class="muted">Sign in securely to continue to your attendance workspace.</p>${message ? `<div class="alert error">${esc(message)}</div>` : ''}<form onsubmit="login(event)"><label>Email<input id="email" type="email" required autocomplete="username" /></label><label>Password<input id="password" type="password" required autocomplete="current-password" /></label><button class="primary full" type="submit">Sign in to workspace</button></form><p class="security-note">Protected company workspace · IST timestamps</p></div></main>`; }
+async function login(e) { e.preventDefault(); try { state.me = await api('/api/auth/login', { method:'POST', body: JSON.stringify({ email:email.value, password:password.value }) }); render(); } catch (err) { loginView(err.message); } }
+async function logout() { try { await api('/api/auth/logout', { method:'POST' }); } catch {} state.me = null; clearRefresh(); loginView(); }
+async function render() { if (!state.me) return loginView(); return state.me.role === 'ADMIN' ? adminDashboard() : employeeDashboard(); }
 
 async function employeeDashboard() {
   try {
-    const data = await api('/api/employee/today');
-    const s = data.session;
-    const activeBreak = data.breaks.find(b => !b.break_end_at);
-    const status = !s || s.check_out_at ? 'LOGGED OUT' : activeBreak ? 'ON BREAK' : 'WORKING';
-    layout('My Attendance', `
-      <section class="welcome"><div><h2>Hi, ${esc(state.me.name)}</h2><p class="muted">All attendance timestamps are recorded by the server/database.</p></div><span class="status ${statusClass(status)}">${status}</span></section>
-      <section class="cards">
-        <div class="card"><span>Login time</span><strong>${fmtTime(data.login_at)}</strong></div>
-        <div class="card"><span>Check in</span><strong>${fmtTime(s?.check_in_at)}</strong></div>
-        <div class="card"><span>Today's breaks</span><strong>${data.breaks.length}</strong></div>
-        <div class="card"><span>Last action</span><strong>${activeBreak ? 'Break started' : s ? (s.check_out_at ? 'Checked out' : 'Working') : 'Not checked in'}</strong></div>
-      </section>
-      <section class="panel action-panel">
-        ${!s ? `<button class="primary big" onclick="employeeAction('/api/employee/check-in')">CHECK IN</button>` : s.check_out_at ? `<p class="muted">Checked out at ${fmtTime(s.check_out_at)}.</p>` : activeBreak ? `<button class="primary big" onclick="employeeAction('/api/employee/break/end')">RESUME WORK</button>` : `<button class="warning big" onclick="employeeAction('/api/employee/break/start')">START BREAK</button><button class="danger big" onclick="employeeAction('/api/employee/check-out')">CHECK OUT</button>`}
-      </section>
-      <section class="panel"><h2>Break history</h2>${data.breaks.length ? `<div class="table-wrap"><table><thead><tr><th>#</th><th>Start</th><th>End</th><th>Duration</th></tr></thead><tbody>${data.breaks.map((b,i)=>`<tr><td>${i+1}</td><td>${fmtTime(b.break_start_at)}</td><td>${fmtTime(b.break_end_at)}</td><td>${esc(b.duration)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">No breaks recorded.</p>'}</section>`);
-    refreshLater(employeeDashboard, 10000);
-  } catch (err) {
-    layout('My Attendance', `<div class="alert error">${esc(err.message)}</div>`);
-  }
+    const data = await api('/api/employee/today'); const s = data.session; const activeBreak = data.breaks.find(b => !b.break_end_at); const completedBreakSeconds = data.breaks.reduce((sum, b) => sum + (Number(b.duration_seconds) || 0), 0); const status = !s ? 'NOT CHECKED IN' : s.check_out_at ? 'CHECKED OUT' : activeBreak ? 'ON BREAK' : 'WORKING';
+    layout('My Attendance', `<section class="welcome hero-welcome"><div><p class="eyebrow">TODAY · ${esc(istToday())}</p><h2>Welcome, ${esc(state.me.name)}</h2><p class="muted">Attendance actions are recorded by the server database in Asia/Kolkata.</p></div><span class="status ${statusClass(status)}">${status}</span></section><section class="cards four"><div class="card"><span>Login time</span><strong>${fmtClock(data.login_at)}</strong></div><div class="card"><span>Check in</span><strong>${fmtClock(s?.check_in_at)}</strong></div><div class="card"><span>Today's breaks</span><strong>${data.breaks.length}</strong></div><div class="card"><span>Break duration</span><strong>${fmtDuration(completedBreakSeconds)}</strong></div></section><section class="panel action-panel"><div><p class="eyebrow">QUICK ACTIONS</p><h2>${status === 'CHECKED OUT' ? 'Attendance completed' : status === 'NOT CHECKED IN' ? 'Ready to begin?' : status === 'ON BREAK' ? 'You are on a break' : 'You are currently working'}</h2></div><div class="action-buttons">${!s ? `<button class="primary big" onclick="employeeAction('/api/employee/check-in')">CHECK IN</button>` : s.check_out_at ? `<p class="muted">Checked out at ${fmtClock(s.check_out_at)}.</p>` : activeBreak ? `<button class="primary big" onclick="employeeAction('/api/employee/break/end')">RESUME WORK</button>` : `<button class="warning big" onclick="employeeAction('/api/employee/break/start')">START BREAK</button><button class="danger big" onclick="employeeAction('/api/employee/check-out')">CHECK OUT</button>`}</div></section><section class="panel"><div class="section-heading"><div><p class="eyebrow">ACTIVITY</p><h2>Today's break history</h2></div><span class="muted">${data.breaks.length ? `${data.breaks.length} record${data.breaks.length === 1 ? '' : 's'}` : 'No activity yet'}</span></div>${data.breaks.length ? `<div class="table-wrap"><table><thead><tr><th>Break</th><th>Started</th><th>Ended</th><th>Duration</th></tr></thead><tbody>${data.breaks.map((b,i)=>`<tr><td>Break ${i + 1}</td><td>${fmtClock(b.break_start_at)}</td><td>${fmtClock(b.break_end_at)}</td><td>${esc(b.duration)}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty-state">No breaks recorded today.</div>'}</section>`);
+    scheduleRefresh(employeeDashboard);
+  } catch (err) { layout('My Attendance', `<div class="alert error">${esc(err.message)} <button class="ghost" onclick="employeeDashboard()">Retry</button></div>`); }
 }
-
-function statusClass(status) { return status === 'WORKING' ? 'green' : status === 'ON BREAK' ? 'yellow' : 'red'; }
-function refreshLater(fn, ms) { clearInterval(state.refreshTimer); state.refreshTimer = setTimeout(fn, ms); }
-async function employeeAction(url) {
-  try { await api(url, { method:'POST', body: JSON.stringify({}) }); await employeeDashboard(); }
-  catch (err) { alert(err.message); }
-}
+async function employeeAction(url) { try { await api(url, { method:'POST', body: '{}' }); await employeeDashboard(); } catch (err) { alert(err.message); } }
 
 async function adminDashboard() {
+  if (state.refreshing) return; state.refreshing = true; clearRefresh();
   try {
-    const [stats, live] = await Promise.all([api('/api/admin/stats'), api('/api/admin/live')]);
-    layout('Admin Dashboard', `
-      <section class="cards four"><div class="card"><span>Employees</span><strong>${stats.employees}</strong></div><div class="card"><span>Working</span><strong>${stats.working}</strong></div><div class="card"><span>On break</span><strong>${stats.on_break}</strong></div><div class="card"><span>Logged out</span><strong>${stats.logged_out}</strong></div></section>
-      <section class="panel"><div class="toolbar"><h2>Live attendance</h2><div><button class="ghost" onclick="employeesPage()">Employees</button> <button class="ghost" onclick="attendancePage()">Attendance & Reports</button></div></div>
-      <div class="table-wrap"><table><thead><tr><th>Employee</th><th>Department</th><th>Status</th><th>Login</th><th>Check in</th></tr></thead><tbody>${live.map(r=>`<tr><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.employee_code)}</span></td><td>${esc(r.designation || '—')}</td><td><span class="status ${statusClass(r.status)}">${esc(r.status)}</span></td><td>${fmtTime(r.login_at)}</td><td>${fmtTime(r.check_in_at)}</td></tr>`).join('')}</tbody></table></div></section>`);
-    refreshLater(adminDashboard, 10000);
-  } catch (err) { layout('Admin Dashboard', `<div class="alert error">${esc(err.message)}</div>`); }
+    const [stats, live] = await Promise.all([api('/api/admin/stats'), api('/api/admin/live')]); const updated = new Date().toISOString();
+    const rows = live.length ? live.map(r => `<tr><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.employee_code)} · ${esc(r.department || r.designation || 'General')}</span></td><td><span class="status ${statusClass(r.status)}">${esc(r.status)}</span></td><td>${fmtClock(r.login_at)}</td><td>${fmtClock(r.check_in_at)}</td><td>${r.status === 'ON BREAK' ? `${fmtClock(r.break_start_at)}<br><span class="muted">${fmtDuration(r.break_seconds)}</span>` : r.status === 'WORKING' ? fmtDuration(r.working_seconds) : '—'}</td><td>${fmtClock(r.check_out_at)}</td></tr>`).join('') : `<tr><td colspan="6"><div class="empty-state">No employees or attendance records yet.</div></td></tr>`;
+    layout('Admin Dashboard', `<section class="dashboard-hero"><div><p class="eyebrow">CONTROL CENTER</p><h2>Good day, ${esc(state.me.name)}</h2><p class="muted">A live view of your workforce attendance.</p></div><div class="hero-actions"><button class="primary" onclick="adminDashboard()">↻ Refresh</button><button class="ghost" onclick="resetAttendance()">Start fresh</button></div></section><div class="refresh-line"><span class="live-dot"></span>Live data · Last updated ${fmtClock(updated)} IST</div><section class="cards six"><div class="metric-card"><span>Total employees</span><strong>${stats.total}</strong><small>All accounts</small></div><div class="metric-card"><span>Active employees</span><strong>${stats.active}</strong><small>Enabled accounts</small></div><div class="metric-card green-accent"><span>Working now</span><strong>${stats.working}</strong><small>Checked in</small></div><div class="metric-card yellow-accent"><span>On break</span><strong>${stats.on_break}</strong><small>Currently paused</small></div><div class="metric-card blue-accent"><span>Checked out</span><strong>${stats.checked_out}</strong><small>Today</small></div><div class="metric-card gray-accent"><span>Not checked in</span><strong>${stats.not_checked_in}</strong><small>Active employees</small></div></section><section class="panel live-panel"><div class="section-heading"><div><p class="eyebrow">REAL-TIME OPERATIONS</p><h2>Live attendance</h2></div><div class="section-actions"><button class="ghost" onclick="employeesPage()">Manage employees</button><button class="ghost" onclick="attendancePage()">History & reports</button></div></div><div class="table-wrap"><table><thead><tr><th>Employee</th><th>Status</th><th>Login</th><th>Check in</th><th>Break / working</th><th>Check out</th></tr></thead><tbody>${rows}</tbody></table></div></section>`);
+  } catch (err) { layout('Admin Dashboard', `<div class="alert error">Unable to refresh dashboard data. <button class="ghost" onclick="adminDashboard()">Retry</button></div>`); }
+  finally { state.refreshing = false; scheduleRefresh(adminDashboard); }
 }
 
-async function employeesPage() {
-  clearInterval(state.refreshTimer);
-  try {
-    const rows = await api('/api/admin/employees');
-    layout('Employees', `<section class="panel"><div class="toolbar"><h2>Employee accounts</h2><button class="primary" onclick="showEmployeeForm()">+ Add employee</button></div>
-      <div class="table-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Login email</th><th>Designation</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.employee_code)}</td><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.department || '')}</span></td><td>${esc(r.email)}</td><td>${esc(r.designation || '—')}</td><td><span class="status ${r.is_active?'green':'red'}">${r.is_active?'ACTIVE':'INACTIVE'}</span></td><td><button class="ghost" onclick='editEmployee(${JSON.stringify(r)})'>Edit</button></td></tr>`).join('')}</tbody></table></div></section>`);
-  } catch (err) { layout('Employees', `<div class="alert error">${esc(err.message)}</div>`); }
-}
-
-function showEmployeeForm(employee=null) {
-  layout(employee ? 'Edit Employee' : 'Create Employee', `<section class="panel form-panel"><form onsubmit="saveEmployee(event, ${employee?employee.id:'null'})"><div class="form-grid">
-    <label>Employee code<input id="f_code" required value="${esc(employee?.employee_code || '')}" /></label>
-    <label>Name<input id="f_name" required value="${esc(employee?.name || '')}" /></label>
-    <label>Email<input id="f_email" type="email" required value="${esc(employee?.email || '')}" /></label>
-    <label>New password ${employee?'(leave blank to keep current)':''}<input id="f_password" type="password" ${employee?'':'required minlength="8"'} /></label>
-    <label>Designation<input id="f_designation" value="${esc(employee?.designation || '')}" /></label>
-    <label>Department<input id="f_department" value="${esc(employee?.department || '')}" /></label>
-    <label>Phone<input id="f_phone" value="${esc(employee?.phone || '')}" /></label>
-    ${employee?`<label>Status<select id="f_active"><option value="1" ${employee.is_active?'selected':''}>Active</option><option value="0" ${!employee.is_active?'selected':''}>Inactive</option></select></label>`:''}
-  </div><div class="actions"><button class="primary" type="submit">${employee?'Save changes':'Create employee'}</button><button class="ghost" type="button" onclick="employeesPage()">Cancel</button></div></form></section>`);
-}
-
-async function saveEmployee(e, id) {
-  e.preventDefault();
-  const body = { employee_code:f_code.value, name:f_name.value, email:f_email.value, password:f_password.value, designation:f_designation.value, department:f_department.value, phone:f_phone.value };
-  if (id) body.is_active = f_active.value === '1'; else if (!body.password || body.password.length < 8) return alert('Password must be at least 8 characters.');
-  if (!body.password) delete body.password;
-  try { await api(id ? `/api/admin/employees/${id}` : '/api/admin/employees', { method:id?'PUT':'POST', body:JSON.stringify(body) }); alert(id?'Employee updated.':'Employee created.'); employeesPage(); }
-  catch(err) { alert(err.message); }
-}
+async function employeesPage() { clearRefresh(); try { state.employees = await api('/api/admin/employees'); renderEmployeesPage(); } catch (err) { layout('Employees', `<div class="alert error">${esc(err.message)} <button class="ghost" onclick="employeesPage()">Retry</button></div>`); } }
+function renderEmployeesPage() { layout('Employees', `<section class="panel"><div class="section-heading"><div><p class="eyebrow">PEOPLE DIRECTORY</p><h2>Employee accounts</h2></div><button class="primary" onclick="showEmployeeForm()">+ Add employee</button></div><div class="filters"><label class="filter-wide">Search<input id="employeeSearch" placeholder="Name, email or employee ID" oninput="renderEmployeeRows()" /></label><label>Status<select id="employeeStatus" onchange="renderEmployeeRows()"><option value="ALL">All statuses</option><option value="ACTIVE">Active</option><option value="INACTIVE">Inactive</option></select></label></div><div id="employeeRows"></div></section>`); renderEmployeeRows(); }
+function renderEmployeeRows() { const query = String(document.getElementById('employeeSearch')?.value || '').toLowerCase(); const status = document.getElementById('employeeStatus')?.value || 'ALL'; const rows = state.employees.filter(r => (!query || `${r.name} ${r.email} ${r.employee_code}`.toLowerCase().includes(query)) && (status === 'ALL' || (r.is_active ? 'ACTIVE' : 'INACTIVE') === status)); document.getElementById('employeeRows').innerHTML = rows.length ? `<div class="table-wrap"><table><thead><tr><th>Employee</th><th>Contact</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows.map(r=>`<tr><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.employee_code)}</span></td><td>${esc(r.email)}<br><span class="muted">${esc(r.phone || 'No phone')}</span></td><td>${esc(r.designation || r.department || 'Employee')}</td><td><span class="status ${r.is_active ? 'green' : 'red'}">${r.is_active ? 'ACTIVE' : 'INACTIVE'}</span></td><td><button class="ghost compact" onclick='editEmployee(${JSON.stringify(r)})'>Edit</button><button class="ghost compact" onclick="toggleEmployee(${r.id}, ${r.is_active ? 'false' : 'true'})">${r.is_active ? 'Deactivate' : 'Activate'}</button><button class="danger-text compact" onclick='deleteEmployee(${r.id}, ${JSON.stringify(esc(r.name))}, ${JSON.stringify(esc(r.email))})'>Delete</button></td></tr>`).join('')}</tbody></table></div>` : '<div class="empty-state">No employees match your search.</div>'; }
+function showEmployeeForm(employee = null) { layout(employee ? 'Edit Employee' : 'Create Employee', `<section class="panel form-panel"><form onsubmit="saveEmployee(event, ${employee ? employee.id : 'null'})"><div class="form-grid"><label>Employee code<input id="f_code" required value="${esc(employee?.employee_code || '')}" /></label><label>Name<input id="f_name" required value="${esc(employee?.name || '')}" /></label><label>Email<input id="f_email" type="email" required value="${esc(employee?.email || '')}" /></label><label>New password<input id="f_password" type="password" ${employee ? '' : 'required minlength="8"'} /></label><label>Designation<input id="f_designation" value="${esc(employee?.designation || '')}" /></label><label>Department<input id="f_department" value="${esc(employee?.department || '')}" /></label><label>Phone<input id="f_phone" value="${esc(employee?.phone || '')}" /></label>${employee ? `<label>Status<select id="f_active"><option value="1" ${employee.is_active?'selected':''}>Active</option><option value="0" ${!employee.is_active?'selected':''}>Inactive</option></select></label>` : ''}</div><div class="actions"><button class="primary" type="submit">${employee ? 'Save changes' : 'Create employee'}</button><button class="ghost" type="button" onclick="employeesPage()">Cancel</button></div></form></section>`); }
+async function saveEmployee(e, id) { e.preventDefault(); const body = { employee_code:f_code.value, name:f_name.value, email:f_email.value, password:f_password.value, designation:f_designation.value, department:f_department.value, phone:f_phone.value }; if (id) body.is_active = f_active.value === '1'; else if (!body.password || body.password.length < 8) return alert('Password must be at least 8 characters.'); if (!body.password) delete body.password; try { await api(id ? `/api/admin/employees/${id}` : '/api/admin/employees', { method:id ? 'PUT' : 'POST', body:JSON.stringify(body) }); employeesPage(); } catch (err) { alert(err.message); } }
 function editEmployee(row) { showEmployeeForm(row); }
+async function toggleEmployee(id, active) { try { await api(`/api/admin/employees/${id}`, { method:'PUT', body:JSON.stringify({ is_active: active }) }); employeesPage(); } catch (err) { alert(err.message); } }
+async function deleteEmployee(id, name, email) { if (!confirm(`Delete ${name} (${email})? This is permanent and only allowed when no attendance history exists.`)) return; try { await api(`/api/admin/employees/${id}`, { method:'DELETE' }); employeesPage(); } catch (err) { alert(err.message); } }
+async function resetAttendance() { if (prompt('This deletes ALL attendance sessions, breaks and employee login/activity history. Type RESET ATTENDANCE to continue:') !== 'RESET ATTENDANCE') return; try { await api('/api/admin/reset-attendance', { method:'POST', body:JSON.stringify({ confirmation:'RESET ATTENDANCE' }) }); await adminDashboard(); alert('Attendance data has been reset. Employee and admin accounts were kept.'); } catch (err) { alert(err.message); } }
 
-async function attendancePage() {
-  clearInterval(state.refreshTimer);
-  const today = istToday();
-  layout('Attendance & Reports', `<section class="panel"><div class="filters"><label>From<input id="from" type="date" value="${today}" /></label><label>To<input id="to" type="date" value="${today}" /></label><button class="primary" onclick="loadAttendance()">Load</button><button class="ghost" onclick="downloadCsv()">Export CSV</button></div><div id="attendanceTable"></div></section>`);
-  await loadAttendance();
-}
-
-async function loadAttendance() {
-  try {
-    const q = new URLSearchParams({ from:from.value, to:to.value });
-    const rows = await api('/api/admin/attendance?' + q.toString());
-    attendanceTable.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Employee</th><th>Check in</th><th>Break</th><th>Check out</th><th>Working</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${fmtDate(r.work_date)}</td><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.employee_code)}</span></td><td>${fmtTime(r.check_in_at)}</td><td>${esc(r.break_duration)}</td><td>${fmtTime(r.check_out_at)}</td><td><strong>${esc(r.working_duration)}</strong></td></tr>`).join('')}</tbody></table></div>`;
-  } catch (err) { attendanceTable.innerHTML = `<div class="alert error">${esc(err.message)}</div>`; }
-}
+async function attendancePage() { clearRefresh(); const today = istToday(); layout('Attendance & Reports', `<section class="panel"><div class="filters"><label>From<input id="from" type="date" value="${today}" /></label><label>To<input id="to" type="date" value="${today}" /></label><button class="primary" onclick="loadAttendance()">Load records</button><button class="ghost" onclick="downloadCsv()">Export CSV</button></div><div id="attendanceTable"></div></section>`); await loadAttendance(); }
+async function loadAttendance() { try { const q = new URLSearchParams({ from:from.value, to:to.value }); const rows = await api('/api/admin/attendance?' + q.toString()); attendanceTable.innerHTML = rows.length ? `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Employee</th><th>Login</th><th>Check in</th><th>Break</th><th>Check out</th><th>Working</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${fmtDate(r.work_date)}</td><td><strong>${esc(r.name)}</strong><br><span class="muted">${esc(r.employee_code)}</span></td><td>${fmtClock(r.login_at)}</td><td>${fmtClock(r.check_in_at)}</td><td>${esc(r.break_duration)}</td><td>${fmtClock(r.check_out_at)}</td><td><strong>${esc(r.working_duration)}</strong></td></tr>`).join('')}</tbody></table></div>` : '<div class="empty-state">No attendance records for this date.</div>'; } catch (err) { attendanceTable.innerHTML = `<div class="alert error">${esc(err.message)} <button class="ghost" onclick="loadAttendance()">Retry</button></div>`; } }
 function downloadCsv() { window.location.href = '/api/admin/export.csv?' + new URLSearchParams({ from:from.value, to:to.value }).toString(); }
 
-(async function boot(){
-  try { state.me = await api('/api/auth/me'); render(); } catch { loginView(); }
-})();
+(async function boot() { try { state.me = await api('/api/auth/me'); render(); } catch { loginView(); } })();

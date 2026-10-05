@@ -377,11 +377,13 @@ app.get('/api/admin/stats', requireAuth, requireRole('ADMIN'), asyncHandler(asyn
   const conn = await pool.getConnection();
   try {
     await withIST(conn);
-    const [[employees]] = await conn.query('SELECT COUNT(*) AS count FROM employees WHERE is_active = 1');
-    const [[working]] = await conn.query('SELECT COUNT(*) AS count FROM attendance_sessions WHERE check_out_at IS NULL');
-    const [[onBreak]] = await conn.query(`SELECT COUNT(*) AS count FROM breaks b JOIN attendance_sessions a ON a.id=b.attendance_id WHERE a.check_out_at IS NULL AND b.break_end_at IS NULL`);
-    const [[loggedOut]] = await conn.query(`SELECT COUNT(*) AS count FROM employees e WHERE e.is_active = 1 AND NOT EXISTS (SELECT 1 FROM attendance_sessions a WHERE a.employee_id=e.id AND a.check_out_at IS NULL)`);
-    res.json({ employees: Number(employees.count), working: Number(working.count), on_break: Number(onBreak.count), logged_out: Number(loggedOut.count) });
+    const [[total]] = await conn.query('SELECT COUNT(*) AS count FROM employees');
+    const [[active]] = await conn.query('SELECT COUNT(*) AS count FROM employees WHERE is_active = 1');
+    const [[working]] = await conn.query('SELECT COUNT(*) AS count FROM attendance_sessions a JOIN employees e ON e.id=a.employee_id WHERE e.is_active=1 AND a.work_date=CURDATE() AND a.check_out_at IS NULL');
+    const [[onBreak]] = await conn.query(`SELECT COUNT(*) AS count FROM breaks b JOIN attendance_sessions a ON a.id=b.attendance_id JOIN employees e ON e.id=a.employee_id WHERE e.is_active=1 AND a.work_date=CURDATE() AND a.check_out_at IS NULL AND b.break_end_at IS NULL`);
+    const [[checkedOut]] = await conn.query(`SELECT COUNT(*) AS count FROM attendance_sessions a JOIN employees e ON e.id=a.employee_id WHERE e.is_active=1 AND a.work_date=CURDATE() AND a.check_out_at IS NOT NULL`);
+    const [[notCheckedIn]] = await conn.query(`SELECT COUNT(*) AS count FROM employees e WHERE e.is_active=1 AND NOT EXISTS (SELECT 1 FROM attendance_sessions a WHERE a.employee_id=e.id AND a.work_date=CURDATE())`);
+    res.json({ total: Number(total.count), active: Number(active.count), working: Number(working.count), on_break: Number(onBreak.count), checked_out: Number(checkedOut.count), not_checked_in: Number(notCheckedIn.count) });
   } finally { conn.release(); }
 }));
 
@@ -390,6 +392,40 @@ app.get('/api/admin/employees', requireAuth, requireRole('ADMIN'), asyncHandler(
   try {
     const [rows] = await conn.query('SELECT id, employee_code, name, email, designation, department, phone, is_active, created_at, updated_at FROM employees ORDER BY name ASC');
     res.json(rows.map(cleanEmployee));
+  } finally { conn.release(); }
+}));
+
+app.delete('/api/admin/employees/:id', requireAuth, requireRole('ADMIN'), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid employee id.' });
+  const conn = await pool.getConnection();
+  try {
+    await withIST(conn);
+    const [[employee]] = await conn.execute('SELECT name, email FROM employees WHERE id = ? LIMIT 1', [id]);
+    if (!employee) return res.status(404).json({ error: 'Employee not found.' });
+    const [[history]] = await conn.execute('SELECT COUNT(*) AS count FROM attendance_sessions WHERE employee_id = ?', [id]);
+    if (Number(history.count) > 0) return res.status(409).json({ error: 'This employee has attendance history. Deactivate the account instead so historical records remain safe.' });
+    await conn.execute('DELETE FROM employees WHERE id = ?', [id]);
+    await conn.execute('INSERT INTO audit_logs (actor_type, actor_id, action, details) VALUES (?,?,?,?)', ['ADMIN', req.user.sub, 'EMPLOYEE_DELETE', JSON.stringify({ employee_id: id, email: employee.email })]);
+    res.json({ ok: true });
+  } finally { conn.release(); }
+}));
+
+app.post('/api/admin/reset-attendance', requireAuth, requireRole('ADMIN'), asyncHandler(async (req, res) => {
+  if (req.body?.confirmation !== 'RESET ATTENDANCE') return res.status(400).json({ error: 'Type RESET ATTENDANCE to confirm this operation.' });
+  const conn = await pool.getConnection();
+  try {
+    await withIST(conn);
+    await conn.beginTransaction();
+    await conn.query('DELETE FROM breaks');
+    await conn.query('DELETE FROM attendance_sessions');
+    await conn.query("DELETE FROM audit_logs WHERE actor_type = 'EMPLOYEE' AND action IN ('LOGIN','CHECK_IN','BREAK_START','BREAK_END','CHECK_OUT')");
+    await conn.execute('INSERT INTO audit_logs (actor_type, actor_id, action, details) VALUES (?,?,?,?)', ['ADMIN', req.user.sub, 'ATTENDANCE_RESET', JSON.stringify({ reset_at: 'DATABASE_NOW' })]);
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (error) {
+    await conn.rollback();
+    throw error;
   } finally { conn.release(); }
 }));
 
@@ -461,6 +497,7 @@ app.get('/api/admin/attendance', requireAuth, requireRole('ADMIN'), asyncHandler
     if (/^\d{4}-\d{2}-\d{2}$/.test(to)) { where += ' AND a.work_date <= ?'; params.push(to); }
     const [rows] = await conn.execute(
       `SELECT a.id, a.work_date, a.check_in_at, a.check_out_at, e.employee_code, e.name, e.email,
+        (SELECT al.created_at FROM audit_logs al WHERE al.actor_type='EMPLOYEE' AND al.actor_id=e.id AND al.action='LOGIN' AND al.created_at >= a.work_date AND al.created_at < DATE_ADD(a.work_date, INTERVAL 1 DAY) ORDER BY al.created_at DESC LIMIT 1) AS login_at,
         COALESCE((SELECT SUM(TIMESTAMPDIFF(SECOND,b.break_start_at,b.break_end_at)) FROM breaks b WHERE b.attendance_id=a.id AND b.break_end_at IS NOT NULL),0) AS break_seconds
        FROM attendance_sessions a JOIN employees e ON e.id=a.employee_id
        WHERE ${where} ORDER BY a.work_date DESC, a.check_in_at DESC`, params
@@ -469,7 +506,7 @@ app.get('/api/admin/attendance', requireAuth, requireRole('ADMIN'), asyncHandler
       const total = r.check_out_at ? diffSeconds(r.check_in_at, r.check_out_at) : null;
       const breakSec = Number(r.break_seconds || 0);
       const working = total == null ? null : Math.max(0, total - breakSec);
-      return { ...r, total_seconds: total, break_seconds: breakSec, working_seconds: working, break_duration: formatDuration(breakSec), working_duration: formatDuration(working), total_duration: formatDuration(total) };
+      return { ...r, status: r.check_out_at ? 'CHECKED OUT' : 'WORKING', total_seconds: total, break_seconds: breakSec, working_seconds: working, break_duration: formatDuration(breakSec), working_duration: formatDuration(working), total_duration: formatDuration(total) };
     });
     res.json(out);
   } finally { conn.release(); }
@@ -480,18 +517,23 @@ app.get('/api/admin/live', requireAuth, requireRole('ADMIN'), asyncHandler(async
   try {
     await withIST(conn);
     const [rows] = await conn.query(
-      `SELECT e.id, e.employee_code, e.name, e.email, e.designation, a.id AS attendance_id, a.check_in_at,
+      `SELECT e.id, e.employee_code, e.name, e.email, e.designation, e.department, e.is_active,
+        a.id AS attendance_id, a.check_in_at, a.check_out_at,
         (SELECT al.created_at FROM audit_logs al
          WHERE al.actor_type = 'EMPLOYEE' AND al.actor_id = e.id AND al.action = 'LOGIN'
            AND al.created_at >= CURDATE() AND al.created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
          ORDER BY al.created_at DESC LIMIT 1) AS login_at,
-        CASE WHEN EXISTS (SELECT 1 FROM breaks b WHERE b.attendance_id=a.id AND b.break_end_at IS NULL) THEN 'ON BREAK' ELSE 'WORKING' END AS status
-       FROM employees e LEFT JOIN attendance_sessions a ON a.employee_id=e.id AND a.check_out_at IS NULL
-       WHERE e.is_active=1 ORDER BY e.name ASC`
+        (SELECT b.break_start_at FROM breaks b WHERE b.attendance_id=a.id AND b.break_end_at IS NULL ORDER BY b.id DESC LIMIT 1) AS break_start_at,
+        COALESCE((SELECT SUM(TIMESTAMPDIFF(SECOND,b.break_start_at,COALESCE(b.break_end_at,NOW()))) FROM breaks b WHERE b.attendance_id=a.id),0) AS break_seconds,
+        TIMESTAMPDIFF(SECOND,a.check_in_at,COALESCE(a.check_out_at,NOW())) - COALESCE((SELECT SUM(TIMESTAMPDIFF(SECOND,b.break_start_at,COALESCE(b.break_end_at,NOW()))) FROM breaks b WHERE b.attendance_id=a.id),0) AS working_seconds
+       FROM employees e LEFT JOIN attendance_sessions a ON a.id=(SELECT a2.id FROM attendance_sessions a2 WHERE a2.employee_id=e.id AND a2.work_date=CURDATE() ORDER BY a2.id DESC LIMIT 1)
+       ORDER BY e.name ASC`
     );
     res.json(rows.map(r => ({
       ...r,
-      status: r.attendance_id ? r.status : 'LOGGED OUT'
+      break_seconds: Number(r.break_seconds || 0),
+      working_seconds: r.working_seconds == null ? null : Math.max(0, Number(r.working_seconds)),
+      status: !r.is_active ? 'INACTIVE' : !r.attendance_id ? 'NOT CHECKED IN' : r.check_out_at ? 'CHECKED OUT' : r.break_start_at ? 'ON BREAK' : 'WORKING'
     })));
   } finally { conn.release(); }
 }));
