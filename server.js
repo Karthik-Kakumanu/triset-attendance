@@ -16,6 +16,7 @@ const PORT = Number(process.env.PORT || 10000);
 const APP_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 const COOKIE_NAME = process.env.COOKIE_NAME || 'attendance_session';
 const JWT_SECRET = process.env.JWT_SECRET;
+const SESSION_IDLE_TIMEOUT_MINUTES = Math.min(24 * 60, Math.max(30, Number(process.env.SESSION_IDLE_TIMEOUT_MINUTES || 720)));
 
 if (!JWT_SECRET) {
   throw new Error('JWT_SECRET is required');
@@ -69,13 +70,14 @@ async function requireAuth(req, res, next) {
     const token = req.cookies[COOKIE_NAME];
     if (!token) return res.status(401).json({ error: 'Not logged in' });
     const user = jwt.verify(token, JWT_SECRET);
-    const table = user.role === 'ADMIN' ? 'admins' : user.role === 'EMPLOYEE' ? 'employees' : null;
-    if (!table || !user.sid) return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    const accountType = user.role === 'ADMIN' ? 'ADMIN' : user.role === 'EMPLOYEE' ? 'EMPLOYEE' : null;
+    if (!accountType || !user.sid) return res.status(401).json({ error: 'Session expired. Please log in again.' });
     const conn = await pool.getConnection();
     try {
       await withIST(conn);
-      const [rows] = await conn.execute(`SELECT active_session_hash FROM ${table} WHERE id = ? AND active_session_hash = ? AND active_session_expires_at > NOW() LIMIT 1`, [user.sub, hashSessionId(user.sid)]);
+      const [rows] = await conn.execute(`SELECT id FROM user_sessions WHERE account_type = ? AND account_id = ? AND session_token_hash = ? AND revoked_at IS NULL AND expires_at > NOW() AND last_seen_at >= DATE_SUB(NOW(), INTERVAL ${SESSION_IDLE_TIMEOUT_MINUTES} MINUTE) LIMIT 1`, [accountType, user.sub, hashSessionId(user.sid)]);
       if (!rows.length) return res.status(401).json({ error: 'This session is no longer active. Please log in again.' });
+      await conn.execute('UPDATE user_sessions SET last_seen_at = NOW() WHERE id = ?', [rows[0].id]);
     } finally {
       conn.release();
     }
@@ -182,21 +184,26 @@ async function ensureSessionColumns(conn) {
   }
 }
 
-async function claimLoginSession(conn, table, id) {
+async function claimLoginSession(conn, table, accountType, id, req) {
   const sessionId = crypto.randomUUID();
   const sessionHash = hashSessionId(sessionId);
   await conn.beginTransaction();
   try {
-    const [rows] = await conn.execute(`SELECT active_session_expires_at, active_session_expires_at > NOW() AS session_is_active FROM ${table} WHERE id = ? FOR UPDATE`, [id]);
+    const [rows] = await conn.execute(`SELECT id FROM ${table} WHERE id = ? FOR UPDATE`, [id]);
     if (!rows.length) {
       await conn.rollback();
       return null;
     }
-    if (Number(rows[0].session_is_active) === 1) {
+    const [activeSessions] = await conn.execute(`SELECT id FROM user_sessions WHERE account_type = ? AND account_id = ? AND revoked_at IS NULL AND expires_at > NOW() AND last_seen_at >= DATE_SUB(NOW(), INTERVAL ${SESSION_IDLE_TIMEOUT_MINUTES} MINUTE) LIMIT 1 FOR UPDATE`, [accountType, id]);
+    if (activeSessions.length) {
       await conn.rollback();
       return null;
     }
-    await conn.execute(`UPDATE ${table} SET active_session_hash = ?, active_session_expires_at = DATE_ADD(NOW(), INTERVAL 12 HOUR) WHERE id = ?`, [sessionHash, id]);
+    await conn.execute(
+      `INSERT INTO user_sessions (account_type, account_id, session_token_hash, created_at, last_seen_at, expires_at, user_agent, ip_address)
+       VALUES (?, ?, ?, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 12 HOUR), ?, ?)`,
+      [accountType, id, sessionHash, String(req.get('user-agent') || '').slice(0, 500), String(req.ip || '').slice(0, 80)]
+    );
     await conn.commit();
     return sessionId;
   } catch (error) {
@@ -234,8 +241,8 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
       if (!admin.is_active || !(await bcrypt.compare(password, admin.password_hash))) {
         return res.status(401).json({ error: 'Invalid login.' });
       }
-      const sessionId = await claimLoginSession(conn, 'admins', admin.id);
-      if (!sessionId) return res.status(409).json({ error: 'This account is already logged in somewhere else. Log out from the other device first.' });
+      const sessionId = await claimLoginSession(conn, 'admins', 'ADMIN', admin.id, req);
+      if (!sessionId) return res.status(409).json({ error: 'ACCOUNT_ALREADY_LOGGED_IN', message: 'This account is already logged in on another device. Log out from the other device first.' });
       issueSession(res, { id: admin.id, role: 'ADMIN', name: admin.name, email: admin.email }, sessionId);
       await conn.execute('INSERT INTO audit_logs (actor_type, actor_id, action, details) VALUES (?,?,?,?)', ['ADMIN', admin.id, 'LOGIN', JSON.stringify({ ip: req.ip })]);
       return res.json({ role: 'ADMIN', name: admin.name, email: admin.email });
@@ -247,8 +254,8 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
     if (!emp.is_active || !(await bcrypt.compare(password, emp.password_hash))) {
       return res.status(401).json({ error: 'Invalid login.' });
     }
-    const sessionId = await claimLoginSession(conn, 'employees', emp.id);
-    if (!sessionId) return res.status(409).json({ error: 'This account is already logged in somewhere else. Log out from the other device first.' });
+    const sessionId = await claimLoginSession(conn, 'employees', 'EMPLOYEE', emp.id, req);
+    if (!sessionId) return res.status(409).json({ error: 'ACCOUNT_ALREADY_LOGGED_IN', message: 'This account is already logged in on another device. Log out from the other device first.' });
     issueSession(res, { id: emp.id, role: 'EMPLOYEE', name: emp.name, email: emp.email }, sessionId);
     await conn.execute('INSERT INTO audit_logs (actor_type, actor_id, action, details) VALUES (?,?,?,?)', ['EMPLOYEE', emp.id, 'LOGIN', JSON.stringify({ ip: req.ip })]);
     return res.json({ role: 'EMPLOYEE', name: emp.name, email: emp.email });
@@ -258,11 +265,11 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/auth/logout', requireAuth, asyncHandler(async (req, res) => {
-  const table = req.user.role === 'ADMIN' ? 'admins' : 'employees';
+  const accountType = req.user.role === 'ADMIN' ? 'ADMIN' : 'EMPLOYEE';
   const conn = await pool.getConnection();
   try {
     await withIST(conn);
-    await conn.execute(`UPDATE ${table} SET active_session_hash = NULL, active_session_expires_at = NULL WHERE id = ? AND active_session_hash = ?`, [req.user.sub, hashSessionId(req.user.sid)]);
+    await conn.execute('UPDATE user_sessions SET revoked_at = NOW() WHERE account_type = ? AND account_id = ? AND session_token_hash = ? AND revoked_at IS NULL', [accountType, req.user.sub, hashSessionId(req.user.sid)]);
   } finally {
     conn.release();
   }

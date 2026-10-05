@@ -63,3 +63,19 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   INDEX idx_audit_created (created_at),
   INDEX idx_audit_actor (actor_type, actor_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  account_type ENUM('ADMIN','EMPLOYEE') NOT NULL,
+  account_id BIGINT UNSIGNED NOT NULL,
+  session_token_hash CHAR(64) NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at DATETIME NOT NULL,
+  user_agent VARCHAR(500) NULL,
+  ip_address VARCHAR(80) NULL,
+  revoked_at DATETIME NULL,
+  UNIQUE KEY uq_session_token_hash (session_token_hash),
+  INDEX idx_session_account (account_type, account_id, revoked_at),
+  INDEX idx_session_expiry (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

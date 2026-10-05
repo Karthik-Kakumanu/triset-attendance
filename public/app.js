@@ -5,7 +5,7 @@ async function api(url, options = {}) {
   const res = await fetch(url, { credentials: 'include', headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options });
   let data = {};
   try { data = await res.json(); } catch {}
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) throw new Error(data.message || data.error || `Request failed (${res.status})`);
   return data;
 }
 

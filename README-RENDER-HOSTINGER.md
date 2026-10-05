@@ -78,6 +78,7 @@ DB_SSL=false
 PORT=10000
 APP_TIMEZONE=Asia/Kolkata
 COOKIE_NAME=attendance_session
+SESSION_IDLE_TIMEOUT_MINUTES=720
 JWT_SECRET=long-random-secret
 ADMIN_NAME=Company Administrator
 ADMIN_EMAIL=your-admin-email
